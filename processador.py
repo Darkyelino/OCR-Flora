@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import easyocr
 import re
 import pandas as pd
@@ -38,7 +37,7 @@ def extrair_texto_com_acuracia(caminho_imagem):
     print(f"\nProcessando imagem: {os.path.basename(caminho_imagem)}")
     try:
         os.environ['EASYOCR_LOGGER'] = 'ERROR'
-        reader = easyocr.Reader(['pt'], gpu=False)
+        reader = easyocr.Reader(['pt', 'en'], gpu=False)
         resultado_ocr = reader.readtext(caminho_imagem)
         if not resultado_ocr:
             print(" -> Nenhum texto detectado.")
@@ -69,41 +68,41 @@ def encontrar_coordenadas(texto):
         ew = match_long.group(4).upper()
     return lat, ns, long, ew
 
-# <-- MUDANÇA AQUI: Novo especialista dedicado a encontrar datas
 def encontrar_data_coleta(texto):
-    # Procura por qualquer padrão de data (dd/mm/yyyy, dd-mm-yy, etc.)
     matches = re.findall(r'\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})\b', texto)
     for match in matches:
         dd, mm, yy = match
-        # Validação simples para evitar datas impossíveis (ex: mês 81)
         if 1 <= int(mm) <= 12 and 1 <= int(dd) <= 31:
-            # Normaliza o ano para 4 dígitos
             if len(yy) == 2:
                 yy = f"20{yy}" if int(yy) < 30 else f"19{yy}"
             return dd, mm, yy
     return '', '', ''
 
-# <-- MUDANÇA AQUI: Especialista de coletor focado apenas em nome e número
 def encontrar_coletor_info(texto):
     padroes = [
-        # Padrão para "Sobrenome, I." e "Nome Sobrenome et al."
         r'([A-Za-z\s,.-]+?,\s*[A-Z\.]+|[A-Za-z\s,.-]+?et al\.)\s+(\d+)\s?(.*)',
-        # Padrão para "Nome Sobrenome" (sem vírgula)
-        r'\b([A-Z][a-z]+[A-Z\s,.-]+)\s+(\d{3,})'
+        r'\b([A-Z][a-z]+[A-Z\s,.-]+)\s+(\d{3,})\s?(.*)'
     ]
     for padrao in padroes:
         match = re.search(padrao, texto, re.IGNORECASE)
         if match:
             collector = match.group(1).strip()
             number = match.group(2).strip()
-            # O que sobra na linha pode ser um co-coletor
             addcoll = match.group(3).strip() if len(match.groups()) > 2 else ('et al.' if 'et al.' in collector else '')
+            date_pattern = r'\s*\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b'
+            addcoll = re.sub(date_pattern, '', addcoll).strip()
             return collector, number, addcoll
     return '', '', ''
 
+# <-- MUDANÇA BILÍNGUE: Função de localização agora entende inglês
 def encontrar_localizacao(texto):
     country, majorarea, minorarea = '', '', ''
-    SIMILARITY_THRESHOLD = 85
+    SIMILARITY_THRESHOLD = 80
+
+    # Lógica de inferência primeiro (agora bilíngue)
+    if 'brasil' in texto.lower() or 'brazil' in texto.lower():
+        country = 'Brasil'
+
     if not minorarea:
         match_abrev = re.search(r'\b([A-Z]{2,})\b\s*[-/]\s*\b(AC)\b', texto, re.IGNORECASE)
         if match_abrev:
@@ -113,7 +112,8 @@ def encontrar_localizacao(texto):
                 minorarea = MUNICIPIOS_ABREV[best_match_abrev]
 
     if not minorarea:
-        match_prefix = re.search(r'(?:Mun[ií]c[ií]pio\s+de|Mun\.?)\s+([A-Za-z\sÀ-ú]+)', texto, re.IGNORECASE)
+        # Padrão agora busca por "Município de", "Mun." ou "Municipality of"
+        match_prefix = re.search(r'(?:Mun[ií]c[ií]pio\s+de|Mun\.?|Municipality\s+of)\s+([A-Za-z\sÀ-ú]+)', texto, re.IGNORECASE)
         if match_prefix:
             cidade_potencial = match_prefix.group(1).strip()
             best_match, score = process.extractOne(cidade_potencial, MUNICIPIOS_ACRE)
@@ -129,7 +129,7 @@ def encontrar_localizacao(texto):
     if minorarea:
         majorarea = 'Acre'
         country = 'Brasil'
-    else:
+    elif not country: # Se ainda não achou o país, tenta inferir pelo estado
         texto_upper = texto.upper()
         for sigla, nome in ESTADOS_BRASIL.items():
             if f' {sigla} ' in texto_upper or f'-{sigla}' in texto_upper or f' {nome.upper()} ' in texto_upper:
@@ -144,7 +144,6 @@ def parse_texto_etiqueta(texto):
     dados = {}
     dados['family'] = encontrar_familia(texto)
     dados['lat'], dados['NS'], dados['long'], dados['EW'] = encontrar_coordenadas(texto)
-    # <-- MUDANÇA AQUI: Chamando os especialistas separados
     dados['colldd'], dados['collmm'], dados['collyy'] = encontrar_data_coleta(texto)
     dados['collector'], dados['number'], dados['addcoll'] = encontrar_coletor_info(texto)
     dados['country'], dados['majorarea'], dados['minorarea'] = encontrar_localizacao(texto)
