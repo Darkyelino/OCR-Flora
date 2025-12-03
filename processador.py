@@ -4,7 +4,7 @@ import re
 import pandas as pd
 import os
 import numpy as np
-from thefuzz import process, fuzz # Importando fuzz também para comparações diretas se necessário
+from thefuzz import process
 
 # --- CONFIGURAÇÕES E CONSTANTES ---
 
@@ -33,7 +33,6 @@ ESTADOS_BRASIL = {
     'SE': 'Sergipe', 'TO': 'Tocantins'
 }
 
-# --- LISTA NEGRA (BLOCKLIST) ---
 PALAVRAS_IGNORADAS = [
     "ACRE", "BRASIL", "AMAZONIA", "FLORA", "PROJETO", "UNIVERSIDADE", "FEDERAL", "ESTADUAL", 
     "INSTITUTO", "JARDIM", "BOTANICO", "HORTUS", "MUSEU", "COLECAO", "COLEÇÃO", "LABORATORIO",
@@ -49,6 +48,18 @@ PALAVRAS_IGNORADAS = [
     "FLORES", "FRUTOS", "PLANTAS", "SEMENTES", "ARVORE", "ÁRVORE", "ARBUSTO", "HERBÁCEA", 
     "CAULE", "FOLHA", "TRONCO", "N.V", "N.V.", "OCCASIONAL", "SECONDARY", "FOREST", "TREE", 
     "FRUITS", "WARTY", "FIELD", "WORK", "SUPPORTED", "FOUNDATION", "PROPERTY", "OWNER"
+]
+
+SOBRENOMES_COMUNS = [
+    "SILVA", "SANTOS", "OLIVEIRA", "SOUZA", "RODRIGUES", "FERREIRA", "ALVES", "PEREIRA", 
+    "LIMA", "GOMES", "COSTA", "RIBEIRO", "MARTINS", "CARVALHO", "ALMEIDA", "LOPES", 
+    "SOARES", "FERNANDES", "VIEIRA", "BARBOSA", "ROCHA", "DIAS", "NASCIMENTO", "ANDRADE", 
+    "MOREIRA", "NUNES", "MARQUES", "MACHADO", "MENDES", "FREITAS", "CARDOSO", "RAMOS", 
+    "GONÇALVES", "GONCALVES", "REIS", "TEIXEIRA", "MOTA", "SANTANA", "VIDAL", "MACEDO", 
+    "DANTAS", "CASTRO", "ARAUJO", "ARAÚJO", "MELO", "MELLO", "CAVALCANTE", "SERRA", "CAMPOS",
+    "FIGUEIREDO", "RIVERO", "DALY", "PRANCE", "CID", "FERREIRA", "MITOSO", "SILVEIRA",
+    "EHRINGHAUS", "LOWY", "NELSON", "PLOWMAN", "DAVIDSE", "CROAT", "ANDERSON", "KALIN", 
+    "ARROYO", "MORI", "KUBITZKI", "MAAS", "PENNINGTON", "PRANCE"
 ]
 
 # --- 1. FUNÇÃO DE EXTRAÇÃO DE TEXTO ---
@@ -106,100 +117,129 @@ def encontrar_data_coleta(texto):
 
     return '', '', ''
 
-# <-- VALIDAÇÃO INTELIGENTE COM FUZZY MATCHING NA BLOCKLIST -->
+# <-- NOVO ESPECIALISTA INDEPENDENTE DE NÚMERO -->
+def encontrar_numero_coleta(texto, data_tuple, lat, long):
+    # 1. Estratégia Explícita (Procura por rótulos)
+    texto_plano = re.sub(r'\s+', ' ', texto)
+    match_explicito = re.search(r'(?:No\.|Nº|Number|Num|#)\s*(\d{1,6})', texto_plano, re.IGNORECASE)
+    if match_explicito:
+        return match_explicito.group(1)
+
+    # 2. Estratégia de Dedução (Acha números e remove o que já sabemos que é outra coisa)
+    # Encontra TODOS os números isolados de 1 a 5 dígitos
+    todos_numeros = re.findall(r'\b(\d{1,5})\b', texto_plano)
+    
+    candidatos = []
+    
+    # Valores a ignorar (partes da data e coordenadas já encontradas)
+    dia, mes, ano = data_tuple
+    valores_proibidos = [dia, mes, ano, lat[:2], lat[:3], long[:2], long[:3]]
+    valores_proibidos = [v for v in valores_proibidos if v] # Remove vazios
+
+    for num in todos_numeros:
+        # Se o número for igual a uma parte da data ou coordenada, ignora
+        if num in valores_proibidos: continue
+        
+        # Ignora anos óbvios se estiverem isolados (ex: 1998, 2005)
+        if len(num) == 4 and (num.startswith('19') or num.startswith('20')):
+            continue
+            
+        candidatos.append(num)
+
+    # Se sobrou algum candidato...
+    if candidatos:
+        # Prioriza o maior número (geralmente numeração de coleta é crescente e maior que dias/meses)
+        # OU o último encontrado antes da data (mas como o texto é plano, difícil saber).
+        # Vamos pegar o candidato que tem mais dígitos, pois geralmente é o identificador único
+        return max(candidatos, key=len)
+        
+    return ''
+
+# --- ESPECIALISTA DE COLETOR (AGORA FOCADO SÓ EM NOMES) ---
+def encontrar_coletor_info(texto):
+    texto_plano = re.sub(r'\s+', ' ', texto)
+    collector, addcoll = '', ''
+
+    # Vamos buscar nomes candidatos usando a Lista Branca como "imã"
+    palavras = texto_plano.split()
+    
+    melhor_candidato = ""
+    melhor_score = 0
+
+    # Varre janelas de palavras procurando sobrenomes conhecidos
+    for i in range(len(palavras)):
+        word = palavras[i].upper().replace(',', '').replace('.', '')
+        
+        # Se a palavra é um sobrenome comum, olhamos em volta
+        if word in SOBRENOMES_COMUNS:
+            # Tenta pegar "Nome Sobrenome" (palavra anterior + atual)
+            inicio = max(0, i-2)
+            fim = min(len(palavras), i+2)
+            fragmento = " ".join(palavras[inicio:fim])
+            
+            # Limpa lixo do fragmento
+            fragmento = re.sub(r'[\d;:!@#$%^&*()_+={}\[\]|\\:"]', '', fragmento).strip()
+            
+            # Valida
+            if validar_nome_coletor(fragmento):
+                # Se achou algo válido que contem um sobrenome comum, é um forte candidato
+                # Preferimos o que aparece primeiro ou o mais completo?
+                # Vamos pegar o primeiro válido encontrado que tenha tamanho razoável
+                if len(fragmento) > len(melhor_candidato):
+                    melhor_candidato = fragmento
+
+    if melhor_candidato:
+        collector = melhor_candidato
+    else:
+        # Fallback: Tenta achar pela data (Âncora) se a busca por sobrenome falhou
+        padrao_data = r'(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})'
+        match_data = re.search(padrao_data, texto_plano, re.IGNORECASE)
+        if match_data:
+            texto_antes = texto_plano[:match_data.start()].strip()
+            # Pega as ultimas palavras antes da data/numero
+            palavras_antes = texto_antes.split()
+            candidato = " ".join(palavras_antes[-5:])
+            # Remove numeros do final (o numero da coleta)
+            candidato = re.sub(r'\d+$', '', candidato).strip()
+            if validar_nome_coletor(candidato):
+                collector = candidato
+
+    # Tenta limpar o collector final de conectores
+    collector = re.sub(r'\s+(?:com|et\sal\.?|n[ºo\.]?)$', '', collector, flags=re.IGNORECASE).strip()
+
+    # Busca Addcoll (Co-coletores)
+    # Geralmente vem depois do nome principal ou tem "et al"
+    if 'et al' in texto_plano.lower():
+        addcoll = 'et al.'
+    elif collector:
+        # Tenta achar o collector no texto original e pegar o que vem depois
+        try:
+            idx = texto_plano.find(collector)
+            if idx != -1:
+                resto = texto_plano[idx+len(collector):idx+len(collector)+50]
+                # Remove o número da coleta do resto, se houver
+                resto = re.sub(r'^\s*[\d\s,.-]+', '', resto).strip()
+                if validar_nome_coletor(resto):
+                    addcoll = resto
+        except: pass
+
+    return collector, addcoll
+
 def validar_nome_coletor(nome):
     if len(nome) < 3: return False
-    # Deve conter letras
     if not re.search(r'[a-zA-Z]', nome): return False
     
-    # Normaliza o nome para comparação
     palavras_nome = nome.upper().replace(',', '').replace('.', '').split()
-    
-    # Prepara a lista negra completa (Termos proibidos + Locais conhecidos)
     locais_proibidos = PALAVRAS_IGNORADAS + [x.upper() for x in MUNICIPIOS_ACRE] + [x.upper() for x in ESTADOS_BRASIL.values()]
-    
-    # Threshold de similaridade (85 é bem rigoroso, 90 é muito seguro)
-    LIMITE_SIMILARIDADE = 85 
+    LIMITE_SIMILARIDADE_NEG = 85 
 
     for p in palavras_nome:
-        if len(p) < 3: continue # Ignora palavras muito curtas como "DE", "DA"
-        
-        # O PULO DO GATO: Fuzzy Match contra a lista negra
-        # extractOne retorna (melhor_match, score)
+        if len(p) < 3: continue
         melhor_match, score = process.extractOne(p, locais_proibidos)
-        
-        if score >= LIMITE_SIMILARIDADE:
-            # print(f"DEBUG: Palavra '{p}' rejeitada por parecer demais com '{melhor_match}' (Score: {score})")
+        if score >= LIMITE_SIMILARIDADE_NEG:
             return False
             
     return True
-
-# --- 3. ESPECIALISTA DE COLETOR (VERSÃO CASCATA ROBUSTA) ---
-def encontrar_coletor_info(texto):
-    texto_plano = re.sub(r'\s+', ' ', texto)
-    
-    collector, number, addcoll = '', '', ''
-
-    # Regex para encontrar datas
-    padrao_data = r'(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})'
-    
-    matches_data = list(re.finditer(padrao_data, texto_plano, re.IGNORECASE))
-    
-    if not matches_data:
-        return encontrar_coletor_sem_data(texto_plano)
-
-    # Itera sobre as datas encontradas (da última para a primeira)
-    for match_data in reversed(matches_data):
-        texto_anterior = texto_plano[:match_data.start()].strip()
-        texto_posterior = texto_plano[match_data.end():].strip()
-
-        # Busca número antes da data
-        match_numero = re.search(r'(.*?)[\s,;]*(?:n[ºo\.]?|com|col\.|no\.)?[\s,]*(\d{1,6})[\s,;-]*$', texto_anterior, re.IGNORECASE)
-
-        if match_numero:
-            raw_name = match_numero.group(1).strip()
-            number = match_numero.group(2).strip()
-        else:
-            raw_name = texto_anterior
-            number = ''
-
-        # Limpeza do nome
-        raw_name = re.sub(r'(?:;|com|n[ºo\.]?)$', '', raw_name, flags=re.IGNORECASE).strip()
-        
-        palavras = raw_name.split()
-        if len(palavras) > 6:
-            candidato_nome = " ".join(palavras[-6:])
-        else:
-            candidato_nome = raw_name
-
-        # Validação com Fuzzy Matching
-        if validar_nome_coletor(candidato_nome):
-            collector = candidato_nome
-            
-            # Co-coletores
-            addcoll = texto_posterior.split('Det.')[0].split('Data')[0].split('Field')[0].split('General')[0].strip()
-            addcoll = re.sub(padrao_data, '', addcoll).strip()
-            
-            return collector, number, addcoll[:100]
-
-    return encontrar_coletor_sem_data(texto_plano)
-
-def encontrar_coletor_sem_data(texto_plano):
-    # Fallback: Procura por "Coletor:", "Leg." ou padrão "Nome, I. 123"
-    
-    match = re.search(r'(?:Coletor|Leg\.|Col\.)\s*:?\s*([A-Za-z\.\s,]+?)(?:\s+(\d{1,5}))?', texto_plano, re.IGNORECASE)
-    if match:
-        nome = match.group(1).strip()
-        num = match.group(2).strip() if match.group(2) else ''
-        if validar_nome_coletor(nome): return nome, num, ''
-
-    match = re.search(r'([A-Z][a-z]+,\s*[A-Z\.]+)\s+(\d{1,5})', texto_plano)
-    if match:
-        nome = match.group(1).strip()
-        num = match.group(2).strip()
-        if validar_nome_coletor(nome): return nome, num, ''
-
-    return '', '', ''
 
 def encontrar_localizacao(texto):
     country, majorarea, minorarea = '', '', ''
@@ -251,7 +291,13 @@ def parse_texto_etiqueta(texto):
     dados['family'] = encontrar_familia(texto)
     dados['lat'], dados['NS'], dados['long'], dados['EW'] = encontrar_coordenadas(texto)
     dados['colldd'], dados['collmm'], dados['collyy'] = encontrar_data_coleta(texto)
-    dados['collector'], dados['number'], dados['addcoll'] = encontrar_coletor_info(texto)
+    
+    # 1. Encontra número INDEPENDENTE
+    dados['number'] = encontrar_numero_coleta(texto, (dados['colldd'], dados['collmm'], dados['collyy']), dados['lat'], dados['long'])
+    
+    # 2. Encontra Coletor INDEPENDENTE
+    dados['collector'], dados['addcoll'] = encontrar_coletor_info(texto)
+    
     dados['country'], dados['majorarea'], dados['minorarea'] = encontrar_localizacao(texto)
     return dados
 
